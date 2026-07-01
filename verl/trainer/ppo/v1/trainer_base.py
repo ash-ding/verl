@@ -638,55 +638,56 @@ class PPOTrainer(ABC):
     def _load_checkpoint(self):
         self.global_steps = 0
 
-        # 1. find latest checkpoint folder
         if self.config.trainer.resume_mode == "disable":
             return
-        elif self.config.trainer.resume_mode == "auto":
+
+        global_step_folder = None
+
+        if self.config.trainer.resume_mode == "auto":
+            # Auto-detect checkpoint in current experiment directory
             checkpoint_folder = self.config.trainer.default_local_dir
             if not os.path.isabs(checkpoint_folder):
-                working_dir = os.getcwd()
-                checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
+                checkpoint_folder = os.path.join(os.getcwd(), checkpoint_folder)
+            global_step_folder = self._find_checkpoint(checkpoint_folder)
+            if global_step_folder is None:
+                logger.info("Training from scratch")
+                return
 
-            # First try latest/ directory (written by _save_latest_checkpoint)
-            latest_dir = os.path.join(checkpoint_folder, "latest")
-            tracker_file = os.path.join(checkpoint_folder, "latest_checkpointed_iteration.txt")
-            if os.path.exists(latest_dir) and os.path.isdir(os.path.join(latest_dir, "actor")) and os.path.exists(tracker_file):
-                with open(tracker_file) as f:
-                    step = int(f.read().strip())
-                global_step_folder = latest_dir
-                self.global_steps = step
-                logger.info(f"Resuming from {global_step_folder} at step {step}")
-            else:
-                # Fall back to global_step_N/ format
-                global_step_folder = find_latest_ckpt_path(checkpoint_folder)
-                if global_step_folder is None:
-                    logger.info("Training from scratch")
-                    return
-                self.global_steps = int(global_step_folder.split("global_step_")[-1])
-                logger.info(f"Resuming from {global_step_folder}, setting global step to {self.global_steps}")
         elif self.config.trainer.resume_mode == "resume_path":
-            assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
-            global_step_folder = self.config.trainer.resume_from_path
-            if not os.path.isabs(global_step_folder):
-                working_dir = os.getcwd()
-                global_step_folder = os.path.join(working_dir, global_step_folder)
-            # Extract step from tracker file or path
-            tracker_file = os.path.join(os.path.dirname(global_step_folder), "latest_checkpointed_iteration.txt")
-            if os.path.exists(tracker_file):
-                with open(tracker_file) as f:
-                    self.global_steps = int(f.read().strip())
-            elif "global_step_" in global_step_folder:
-                self.global_steps = int(global_step_folder.split("global_step_")[-1])
-            else:
-                raise ValueError(f"Cannot determine step from {global_step_folder}. "
-                                 f"Provide a path with global_step_N or ensure latest_checkpointed_iteration.txt exists.")
-            logger.info(f"Resuming from {global_step_folder}, setting global step to {self.global_steps}")
-        else:
-            logger.exception(f"Unknown resume mode {self.config.trainer.resume_mode}")
+            # Load from an explicitly specified checkpoint directory
+            # Supports both:
+            #   - Same experiment resume: resume_from_path=checkpoints/.../latest
+            #   - Cross-experiment resume: resume_from_path=checkpoints/old_run/latest
+            #     (new results saved to current experiment's default_local_dir)
+            resume_path = self.config.trainer.resume_from_path
+            assert isinstance(resume_path, str), "resume_from_path must be a string"
+            if not os.path.isabs(resume_path):
+                resume_path = os.path.join(os.getcwd(), resume_path)
 
-        # 2. load actor checkpoint
+            # If pointing to an experiment dir (not latest/ or global_step_N/), find checkpoint within it
+            if os.path.isdir(os.path.join(resume_path, "latest", "actor")):
+                global_step_folder = self._find_checkpoint(resume_path)
+            elif os.path.isdir(os.path.join(resume_path, "actor")):
+                # Directly pointing to a checkpoint folder (latest/ or global_step_N/)
+                global_step_folder = resume_path
+            else:
+                global_step_folder = self._find_checkpoint(resume_path)
+
+            if global_step_folder is None:
+                raise ValueError(f"No valid checkpoint found at {resume_path}")
+        else:
+            raise ValueError(f"Unknown resume mode: {self.config.trainer.resume_mode}")
+
+        # Determine step number
+        self.global_steps = self._extract_step(global_step_folder)
+        logger.info(f"Resuming from {global_step_folder} at step {self.global_steps}")
+
+        # load actor checkpoint
+        actor_path = os.path.join(global_step_folder, "actor")
+        if not os.path.isdir(actor_path):
+            raise FileNotFoundError(f"Actor checkpoint not found at {actor_path}")
         self.actor_rollout_wg.load_checkpoint(
-            local_path=os.path.join(global_step_folder, "actor"),
+            local_path=actor_path,
             del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
         )
 
@@ -705,35 +706,81 @@ class PPOTrainer(ABC):
         else:
             logger.warning(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+    @staticmethod
+    def _find_checkpoint(experiment_dir: str):
+        """Find the best checkpoint in an experiment directory.
+
+        Priority: latest/ (with actor/) > global_step_N/ (highest N)
+        Returns the checkpoint folder path, or None if not found.
+        """
+        # 1. Check latest/ directory
+        latest_dir = os.path.join(experiment_dir, "latest")
+        tracker_file = os.path.join(experiment_dir, "latest_checkpointed_iteration.txt")
+        if (os.path.isdir(os.path.join(latest_dir, "actor")) and os.path.exists(tracker_file)):
+            return latest_dir
+
+        # 2. Fall back to global_step_N/ format
+        return find_latest_ckpt_path(experiment_dir)
+
+    @staticmethod
+    def _extract_step(checkpoint_folder: str) -> int:
+        """Extract the step number from a checkpoint folder.
+
+        Checks (in order):
+        1. latest_checkpointed_iteration.txt in parent directory
+        2. global_step_N in path name
+        """
+        # Check tracker file in parent (for latest/) or same dir (for experiment root)
+        for parent in [os.path.dirname(checkpoint_folder), checkpoint_folder]:
+            tracker = os.path.join(parent, "latest_checkpointed_iteration.txt")
+            if os.path.exists(tracker):
+                with open(tracker) as f:
+                    return int(f.read().strip())
+
+        # Extract from path name
+        if "global_step_" in checkpoint_folder:
+            return int(checkpoint_folder.rstrip("/").split("global_step_")[-1])
+
+        raise ValueError(
+            f"Cannot determine step from {checkpoint_folder}. "
+            f"Ensure latest_checkpointed_iteration.txt exists or path contains global_step_N."
+        )
+
     def _save_latest_checkpoint(self):
         """Save latest LoRA weights + optimizer + PUCT state for crash recovery.
 
         Overwrites previous latest checkpoint each step so it doesn't accumulate.
         On resume, the trainer loads from this directory.
+
+        Write order ensures atomicity:
+        1. PUCT state (can be re-derived if lost)
+        2. Actor weights + optimizer (most important)
+        3. Dataloader state (least important)
+        4. Step number tracker (written LAST — if this exists, checkpoint is complete)
         """
         from verl.utils.fs import local_mkdir_safe
 
         latest_dir = os.path.join(self.config.trainer.default_local_dir, "latest")
         local_mkdir_safe(latest_dir)
 
-        # Flush PUCT state FIRST (before actor checkpoint for atomicity)
+        # 1. Flush PUCT state
         if hasattr(self, 'agent_loop_manager') and self.agent_loop_manager is not None:
             puct_actor = getattr(self.agent_loop_manager, '_puct_actor', None)
             if puct_actor is not None:
                 import ray
                 ray.get(puct_actor.flush.remote(self.global_steps))
 
-        # Save actor weights + optimizer state
+        # 2. Save actor weights + optimizer state
         actor_latest_path = os.path.join(latest_dir, "actor")
         self.actor_rollout_wg.save_checkpoint(
             actor_latest_path, None, self.global_steps, max_ckpt_to_keep=1
         )
 
-        # Save dataloader state
+        # 3. Save dataloader state
         dataloader_path = os.path.join(latest_dir, "data.pt")
         torch.save(self.train_dataloader.state_dict(), dataloader_path)
 
-        # Write step number for resume
+        # 4. Write step number LAST (acts as "checkpoint complete" marker)
         latest_step_file = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
         )
