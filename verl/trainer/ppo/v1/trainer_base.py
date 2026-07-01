@@ -682,29 +682,48 @@ class PPOTrainer(ABC):
         self.global_steps = self._extract_step(global_step_folder)
         logger.info(f"Resuming from {global_step_folder} at step {self.global_steps}")
 
-        # load actor checkpoint
+        # Check compatibility and load actor checkpoint
         actor_path = os.path.join(global_step_folder, "actor")
         if not os.path.isdir(actor_path):
             raise FileNotFoundError(f"Actor checkpoint not found at {actor_path}")
-        self.actor_rollout_wg.load_checkpoint(
-            local_path=actor_path,
-            del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
-        )
 
-        # 3. load critic checkpoint
-        if self.use_critic:
-            self.critic_wg.load_checkpoint(
-                local_path=os.path.join(global_step_folder, str(Role.Critic)),
+        compatible = self._check_checkpoint_compatibility(actor_path)
+        if compatible:
+            # Same parallel config → load FSDP shards directly (with optimizer)
+            self.actor_rollout_wg.load_checkpoint(
+                local_path=actor_path,
                 del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
             )
+        else:
+            # Different parallel config → try exported LoRA adapter
+            exported_lora = os.path.join(actor_path, "exported_lora")
+            if os.path.isdir(exported_lora):
+                logger.info(f"World size mismatch. Loading from exported LoRA adapter: {exported_lora}")
+                self._load_from_lora_adapter(exported_lora)
+            else:
+                raise ValueError(
+                    f"Checkpoint at {actor_path} was saved with a different parallel config "
+                    f"and no exported LoRA adapter found. Run:\n"
+                    f"  python scripts/export_lora.py {actor_path}\n"
+                    f"Then retry."
+                )
 
-        # 4. load dataloader checkpoint
+        # Load critic checkpoint
+        if self.use_critic:
+            critic_path = os.path.join(global_step_folder, str(Role.Critic))
+            if os.path.isdir(critic_path):
+                self.critic_wg.load_checkpoint(
+                    local_path=critic_path,
+                    del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+                )
+
+        # Load dataloader checkpoint
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
-            logger.warning(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+            logger.warning(f"No dataloader state found at {dataloader_local_path}, starting from scratch")
 
     @staticmethod
     def _find_checkpoint(experiment_dir: str):
@@ -744,6 +763,39 @@ class PPOTrainer(ABC):
         raise ValueError(
             f"Cannot determine step from {checkpoint_folder}. "
             f"Ensure latest_checkpointed_iteration.txt exists or path contains global_step_N."
+        )
+
+    def _check_checkpoint_compatibility(self, actor_path: str) -> bool:
+        """Check if a checkpoint's parallel config matches the current setup."""
+        import json as _json
+        fsdp_config_path = os.path.join(actor_path, "fsdp_config.json")
+        if not os.path.exists(fsdp_config_path):
+            return True  # No config file → assume compatible
+        with open(fsdp_config_path) as f:
+            saved_config = _json.load(f)
+        saved_ws = saved_config.get("world_size")
+        if saved_ws is None:
+            return True
+        current_ws = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        if saved_ws != current_ws:
+            logger.warning(
+                f"Checkpoint world_size={saved_ws} != current world_size={current_ws}"
+            )
+            return False
+        return True
+
+    def _load_from_lora_adapter(self, lora_path: str):
+        """Load a PEFT LoRA adapter as initial weights (cross-config resume).
+
+        This reinitializes the model with the exported adapter. Optimizer state
+        is NOT restored (starts fresh).
+        """
+        logger.info(f"Loading LoRA adapter from {lora_path}")
+        # VERL's actor worker supports loading LoRA via config
+        # We trigger a re-initialization with the adapter path
+        self.actor_rollout_wg.load_checkpoint(
+            local_path=lora_path,
+            del_local_after_load=False,
         )
 
     def _save_latest_checkpoint(self):
