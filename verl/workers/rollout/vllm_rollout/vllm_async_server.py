@@ -538,15 +538,14 @@ class vLLMHttpServer:
         except TypeError:
             prompt = prompt_kwargs
 
-        # Add lora request
+        # LoRA adapter disabled — using lora.merge=True mode where LoRA weights
+        # are merged into base model before weight sync. This avoids CUDA IPC
+        # corruption of adapter weights observed with PyTorch 2.11.
         lora_request = None
-        if self.lora_as_adapter:
-            # Make sure we also check that the lora is already loaded in the engine
-            lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
-            if lora_loaded:
-                lora_request = LoRARequest(
-                    lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
-                )
+
+        with open("/tmp/verl_vllm_debug.log", "a") as _dbg:
+            _dbg.write(f"GENERATE: prompt_len={len(prompt_ids)}, max_tokens={max_tokens}, "
+                       f"stop_ids={sampling_params.stop_token_ids}, lora={lora_request is not None}\n")
 
         generator = self.engine.generate(
             prompt=prompt,
@@ -581,6 +580,10 @@ class vLLMHttpServer:
             result_dict=extra_fields,
         )
         token_ids = final_res.outputs[0].token_ids
+        finish_reason_raw = final_res.outputs[0].finish_reason
+        with open("/tmp/verl_vllm_debug.log", "a") as _dbg:
+            _dbg.write(f"RESULT: {len(token_ids)} tokens, finish={finish_reason_raw}, "
+                       f"first5={list(token_ids[:5])}\n")
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]

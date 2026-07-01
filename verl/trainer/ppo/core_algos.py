@@ -2485,3 +2485,7 @@ def compute_policy_loss_bypass_mode(
     pg_metrics.update(rollout_metrics)
 
     return pg_loss, pg_metrics
+
+
+# Auto-register custom advantage estimators
+import verl.trainer.ppo.adv_estimators  # noqa: E402, F401

@@ -255,6 +255,10 @@ def compute_advantage(
         }
         if "uid" in data.non_tensor_batch:  # optional
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
+        if "old_log_probs" in data.batch:  # for KL-adjusted advantage estimators
+            adv_kwargs["old_log_probs"] = data.batch["old_log_probs"]
+        if "ref_log_prob" in data.batch:  # for KL-adjusted advantage estimators
+            adv_kwargs["ref_log_prob"] = data.batch["ref_log_prob"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
         # GDPO: pass raw data for per-dimension reward extraction

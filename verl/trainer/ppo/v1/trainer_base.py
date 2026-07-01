@@ -363,7 +363,11 @@ class PPOTrainer(ABC):
                 batch = self.step(metrics, self.timing_raw)
                 self._stop_profiling()
 
-                # 2. save checkpoint
+                # 2. save latest checkpoint (every step, overwritten)
+                with marked_timer("save_latest", self.timing_raw, color="green"):
+                    self._save_latest_checkpoint()
+
+                # 3. save periodic checkpoint (every N steps, weights only, for analysis)
                 if self.config.trainer.save_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.save_freq == 0
                 ):
@@ -642,23 +646,43 @@ class PPOTrainer(ABC):
             if not os.path.isabs(checkpoint_folder):
                 working_dir = os.getcwd()
                 checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
-            global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
-            if global_step_folder is None:
-                logger.info("Training from scratch")
-                return
+
+            # First try latest/ directory (written by _save_latest_checkpoint)
+            latest_dir = os.path.join(checkpoint_folder, "latest")
+            tracker_file = os.path.join(checkpoint_folder, "latest_checkpointed_iteration.txt")
+            if os.path.exists(latest_dir) and os.path.isdir(os.path.join(latest_dir, "actor")) and os.path.exists(tracker_file):
+                with open(tracker_file) as f:
+                    step = int(f.read().strip())
+                global_step_folder = latest_dir
+                self.global_steps = step
+                logger.info(f"Resuming from {global_step_folder} at step {step}")
+            else:
+                # Fall back to global_step_N/ format
+                global_step_folder = find_latest_ckpt_path(checkpoint_folder)
+                if global_step_folder is None:
+                    logger.info("Training from scratch")
+                    return
+                self.global_steps = int(global_step_folder.split("global_step_")[-1])
+                logger.info(f"Resuming from {global_step_folder}, setting global step to {self.global_steps}")
         elif self.config.trainer.resume_mode == "resume_path":
             assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
-            assert "global_step_" in self.config.trainer.resume_from_path, "resume ckpt must specify the global_steps"
             global_step_folder = self.config.trainer.resume_from_path
             if not os.path.isabs(global_step_folder):
                 working_dir = os.getcwd()
                 global_step_folder = os.path.join(working_dir, global_step_folder)
+            # Extract step from tracker file or path
+            tracker_file = os.path.join(os.path.dirname(global_step_folder), "latest_checkpointed_iteration.txt")
+            if os.path.exists(tracker_file):
+                with open(tracker_file) as f:
+                    self.global_steps = int(f.read().strip())
+            elif "global_step_" in global_step_folder:
+                self.global_steps = int(global_step_folder.split("global_step_")[-1])
+            else:
+                raise ValueError(f"Cannot determine step from {global_step_folder}. "
+                                 f"Provide a path with global_step_N or ensure latest_checkpointed_iteration.txt exists.")
+            logger.info(f"Resuming from {global_step_folder}, setting global step to {self.global_steps}")
         else:
             logger.exception(f"Unknown resume mode {self.config.trainer.resume_mode}")
-
-        # set global step
-        self.global_steps = int(global_step_folder.split("global_step_")[-1])
-        logger.info(f"Resuming from {global_step_folder}, setting global step to {self.global_steps}")
 
         # 2. load actor checkpoint
         self.actor_rollout_wg.load_checkpoint(
@@ -681,8 +705,45 @@ class PPOTrainer(ABC):
         else:
             logger.warning(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+    def _save_latest_checkpoint(self):
+        """Save latest LoRA weights + optimizer + PUCT state for crash recovery.
+
+        Overwrites previous latest checkpoint each step so it doesn't accumulate.
+        On resume, the trainer loads from this directory.
+        """
+        from verl.utils.fs import local_mkdir_safe
+
+        latest_dir = os.path.join(self.config.trainer.default_local_dir, "latest")
+        local_mkdir_safe(latest_dir)
+
+        # Flush PUCT state FIRST (before actor checkpoint for atomicity)
+        if hasattr(self, 'agent_loop_manager') and self.agent_loop_manager is not None:
+            puct_actor = getattr(self.agent_loop_manager, '_puct_actor', None)
+            if puct_actor is not None:
+                import ray
+                ray.get(puct_actor.flush.remote(self.global_steps))
+
+        # Save actor weights + optimizer state
+        actor_latest_path = os.path.join(latest_dir, "actor")
+        self.actor_rollout_wg.save_checkpoint(
+            actor_latest_path, None, self.global_steps, max_ckpt_to_keep=1
+        )
+
+        # Save dataloader state
+        dataloader_path = os.path.join(latest_dir, "data.pt")
+        torch.save(self.train_dataloader.state_dict(), dataloader_path)
+
+        # Write step number for resume
+        latest_step_file = os.path.join(
+            self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
+        )
+        with open(latest_step_file, "w") as f:
+            f.write(str(self.global_steps))
+
+        logger.info(f"Latest checkpoint saved at step {self.global_steps}")
+
     def _save_checkpoint(self):
-        """Save actor, critic, and dataloader checkpoints to local (and optionally remote) storage."""
+        """Save actor weights periodically for analysis. No optimizer state (use latest/ for resume)."""
         from verl.utils.fs import local_mkdir_safe
 
         local_global_step_folder = os.path.join(
@@ -729,21 +790,9 @@ class PPOTrainer(ABC):
                 critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
             )
 
-        # save dataloader state
-        local_mkdir_safe(local_global_step_folder)
-        dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
-        torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
-
-        # write latest checkpointed iteration tracker for atomic resume
-        actor_ckpt_cfg = self.config.actor_rollout_ref.actor.get("checkpoint", {})
-        if actor_ckpt_cfg.get("async_save", False):
-            logger.info("skip write latest_checkpointed_iteration.txt when async_save is True")
-            return
-        local_latest_checkpointed_iteration = os.path.join(
-            self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
-        )
-        with open(local_latest_checkpointed_iteration, "w") as f:
-            f.write(str(self.global_steps))
+        # Periodic checkpoints are for analysis only.
+        # Resume uses latest/ directory saved by _save_latest_checkpoint().
+        logger.info(f"Periodic checkpoint (weights only) saved at step {self.global_steps}")
 
     def _validate(self) -> dict[str, float]:
         # Lists to collect samples for the table

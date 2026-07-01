@@ -84,6 +84,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     # select fields and convert to padded tensor
     fields = ["response_mask", "old_log_probs", "advantages"]
+    if "fine_grained_mask" in data:
+        fields.append("fine_grained_mask")
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
@@ -91,6 +93,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
+    if "fine_grained_mask" in data:
+        response_mask = response_mask & data["fine_grained_mask"].to(bool)
     # compute policy loss
     old_log_prob = data["old_log_probs"]
     advantages = data["advantages"]

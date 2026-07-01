@@ -107,7 +107,10 @@ class ServerAdapter(BaseRollout):
         job_id = ray.get_runtime_context().get_job_id()
         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
 
-        self.use_shm = not is_support_ipc()
+        # Force SHM for weight transfer — CUDA IPC silently corrupts LoRA
+        # adapter weights with PyTorch 2.11 + CUDA 12.9 (rebuild_cuda_tensor
+        # returns garbage data without raising an error).
+        self.use_shm = True
         if self.use_shm:
             logger.warning(
                 "IPC is not supported on your devices. Falling back to shared memory for weight transfer, "
