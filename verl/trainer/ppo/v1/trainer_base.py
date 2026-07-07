@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -363,11 +364,17 @@ class PPOTrainer(ABC):
                 batch = self.step(metrics, self.timing_raw)
                 self._stop_profiling()
 
-                # 2. save latest checkpoint (every step, overwritten)
+                # 2. dump rollout generations BEFORE checkpoint so a crash
+                #    after checkpoint save doesn't lose the rollout file
+                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                if rollout_data_dir:
+                    self._log_rollout_data(batch, self.timing_raw, rollout_data_dir)
+
+                # 3. save latest checkpoint (every step, overwritten)
                 with marked_timer("save_latest", self.timing_raw, color="green"):
                     self._save_latest_checkpoint()
 
-                # 3. save periodic checkpoint (every N steps, weights only, for analysis)
+                # 4. save periodic checkpoint (every N steps, weights only, for analysis)
                 if self.config.trainer.save_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.save_freq == 0
                 ):
@@ -376,7 +383,7 @@ class PPOTrainer(ABC):
 
                 self.on_step_end()
 
-            # 4. validate
+            # 5. validate
             if self.config.trainer.test_freq > 0 and (
                 is_last_step or self.global_steps % self.config.trainer.test_freq == 0
             ):
@@ -388,13 +395,8 @@ class PPOTrainer(ABC):
                         last_val_metrics = val_metrics
                 metrics.update(val_metrics)
 
-            # 5. record metrics
+            # 6. record metrics
             self._compute_metrics(batch, metrics, self.timing_raw, global_steps=self.global_steps, epoch=current_epoch)
-
-            # 6. dump rollout generations if enabled
-            rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-            if rollout_data_dir:
-                self._log_rollout_data(batch, self.timing_raw, rollout_data_dir)
 
             # 7. cleanup transfer queue
             tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
@@ -776,7 +778,7 @@ class PPOTrainer(ABC):
         saved_ws = saved_config.get("world_size")
         if saved_ws is None:
             return True
-        current_ws = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        current_ws = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
         if saved_ws != current_ws:
             logger.warning(
                 f"Checkpoint world_size={saved_ws} != current world_size={current_ws}"
@@ -804,16 +806,21 @@ class PPOTrainer(ABC):
         Overwrites previous latest checkpoint each step so it doesn't accumulate.
         On resume, the trainer loads from this directory.
 
-        Write order ensures atomicity:
-        1. PUCT state (can be re-derived if lost)
-        2. Actor weights + optimizer (most important)
-        3. Dataloader state (least important)
-        4. Step number tracker (written LAST — if this exists, checkpoint is complete)
+        Uses atomic write-then-rename: writes to latest_tmp/, then renames to
+        latest/ so a crash mid-save never leaves a corrupt checkpoint.
         """
         from verl.utils.fs import local_mkdir_safe
 
         latest_dir = os.path.join(self.config.trainer.default_local_dir, "latest")
-        local_mkdir_safe(latest_dir)
+        tmp_dir = os.path.join(self.config.trainer.default_local_dir, "latest_tmp")
+        old_dir = os.path.join(self.config.trainer.default_local_dir, "latest_old")
+
+        # Clean up any leftover tmp/old dirs from a previous crash
+        for d in [tmp_dir, old_dir]:
+            if os.path.exists(d):
+                shutil.rmtree(d)
+
+        local_mkdir_safe(tmp_dir)
 
         # 1. Flush PUCT state
         if hasattr(self, 'agent_loop_manager') and self.agent_loop_manager is not None:
@@ -822,17 +829,24 @@ class PPOTrainer(ABC):
                 import ray
                 ray.get(puct_actor.flush.remote(self.global_steps))
 
-        # 2. Save actor weights + optimizer state
-        actor_latest_path = os.path.join(latest_dir, "actor")
+        # 2. Save actor weights + optimizer state to tmp dir
+        actor_tmp_path = os.path.join(tmp_dir, "actor")
         self.actor_rollout_wg.save_checkpoint(
-            actor_latest_path, None, self.global_steps, max_ckpt_to_keep=1
+            actor_tmp_path, None, self.global_steps
         )
 
-        # 3. Save dataloader state
-        dataloader_path = os.path.join(latest_dir, "data.pt")
+        # 3. Save dataloader state to tmp dir
+        dataloader_path = os.path.join(tmp_dir, "data.pt")
         torch.save(self.train_dataloader.state_dict(), dataloader_path)
 
-        # 4. Write step number LAST (acts as "checkpoint complete" marker)
+        # 4. Atomic swap: latest -> latest_old, latest_tmp -> latest, remove latest_old
+        if os.path.exists(latest_dir):
+            os.rename(latest_dir, old_dir)
+        os.rename(tmp_dir, latest_dir)
+        if os.path.exists(old_dir):
+            shutil.rmtree(old_dir)
+
+        # 5. Write step number LAST (acts as "checkpoint complete" marker)
         latest_step_file = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
         )
