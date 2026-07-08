@@ -92,19 +92,20 @@ class GlobalRequestLoadBalancer:
             # Server was removed, clear stale cache entry and re-select
             del self._request_id_to_server[request_id]
 
-        # Select new server (least-loaded among available)
+        # Select new server
         if not self._inflight_requests:
             raise RuntimeError("No available servers in load balancer")
 
-        min_count = min(self._inflight_requests.values())
-        candidates = [sid for sid, count in self._inflight_requests.items() if count == min_count]
-        if len(candidates) == 1:
-            server_id = candidates[0]
-        elif self._full_determinism:
-            # Deterministic tie-breaking: same request_id → same server across runs
-            server_id = candidates[hash(request_id) % len(candidates)]
+        if self._full_determinism:
+            # Deterministic routing: hash-based, independent of arrival order
+            all_server_ids = sorted(self._inflight_requests.keys())
+            server_id = all_server_ids[hash(request_id) % len(all_server_ids)]
         else:
+            # Least-loaded among available
+            min_count = min(self._inflight_requests.values())
+            candidates = [sid for sid, count in self._inflight_requests.items() if count == min_count]
             server_id = candidates[0]
+
         self._request_id_to_server[request_id] = server_id
         self._inflight_requests[server_id] += 1
         return server_id, self._servers[server_id]
@@ -232,7 +233,7 @@ class LLMServerClient:
                 {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
             )
             output: TokenOutput = await server.generate.remote(
-                request_id=uuid4().hex,  # use new request_id for each turn
+                request_id=request_id if getattr(self.config.actor_rollout_ref.rollout, "full_determinism", False) else uuid4().hex,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
