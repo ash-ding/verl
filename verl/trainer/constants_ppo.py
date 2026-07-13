@@ -76,4 +76,8 @@ def get_ppo_ray_runtime_env():
     # Always forward these at call-time, not import-time.
     for key in ("PYTHONHASHSEED", "VERL_FULL_DETERMINISM", "VLLM_BATCH_INVARIANT"):
         runtime_env["env_vars"][key] = os.environ.get(key, "0")
+    # Forward all DISCOVER_* and GPU eval env vars to Ray actors
+    for key, val in os.environ.items():
+        if key.startswith("DISCOVER_") or key.startswith("KERNEL_EVAL_") or key in ("GPU_EVAL_REMOTE", "GPU_EVAL_SERVER"):
+            runtime_env["env_vars"][key] = val
     return runtime_env

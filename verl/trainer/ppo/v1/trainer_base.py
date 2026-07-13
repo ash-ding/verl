@@ -1155,8 +1155,12 @@ class PPOTrainer(ABC):
     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout data from TransferQueue and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+            real_keys = [k for k, tag in zip(batch.keys, batch.tags) if not tag.get("is_padding", False)]
+            if not real_keys:
+                return
+
             fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
-            data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+            data = tq.kv_batch_get(keys=real_keys, partition_id=batch.partition_id, select_fields=fields)
             data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
 
@@ -1173,7 +1177,7 @@ class PPOTrainer(ABC):
 
             # Sort by uid key ({sample}_{rollout}_{output})
             sort_keys = []
-            for key in batch.keys:
+            for key in real_keys:
                 parts = key.rsplit("_", 2)
                 if len(parts) == 3:
                     sort_keys.append((parts[0], int(parts[1]), int(parts[2])))
@@ -1186,7 +1190,7 @@ class PPOTrainer(ABC):
             gts = [gts[i] for i in sorted_indices]
             scores = [scores[i] for i in sorted_indices]
 
-            reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+            reward_extra_infos_dict = {"uid": [real_keys[i] for i in sorted_indices]}
 
             self._dump_generations(
                 inputs=inputs,
