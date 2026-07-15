@@ -76,7 +76,13 @@ def need_reference_policy(
     config: DictConfig,
 ) -> bool:
     """Given the config, do we need ref policy."""
-    return config.algorithm.get("use_kl_in_reward", False) or config.actor_rollout_ref.actor.use_kl_loss
+    if config.algorithm.get("use_kl_in_reward", False) or config.actor_rollout_ref.actor.use_kl_loss:
+        return True
+    if config.algorithm.adv_estimator == "entropic_adaptive_beta":
+        kl_ctrl = config.algorithm.get("kl_ctrl", None)
+        if kl_ctrl and kl_ctrl.get("kl_coef", 0) > 0:
+            return True
+    return False
 
 
 def need_teacher_policy(
