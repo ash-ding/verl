@@ -462,10 +462,13 @@ class PPOTrainer(ABC):
             with marked_timer("update_critic", timing_raw, color="pink"):
                 batch = self._update_critic(batch, metrics=metrics)
 
-        # 10. update actor
+        # 10. update actor (skip when all advantages are zero — no training signal)
         if self.config.trainer.critic_warmup <= self.global_steps:
-            with marked_timer("update_actor", timing_raw, color="red"):
-                batch = self._update_actor(batch, metrics=metrics)
+            if not metrics.get("_has_training_signal", True):
+                pprint("[TTT-Discover] All advantages are zero — skipping actor update (no training signal)")
+            else:
+                with marked_timer("update_actor", timing_raw, color="red"):
+                    batch = self._update_actor(batch, metrics=metrics)
 
         return batch
 
@@ -1159,7 +1162,7 @@ class PPOTrainer(ABC):
             if not real_keys:
                 return
 
-            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
+            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model", "extra_fields"]
             data = tq.kv_batch_get(keys=real_keys, partition_id=batch.partition_id, select_fields=fields)
             data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
@@ -1174,6 +1177,18 @@ class PPOTrainer(ABC):
                 gts = [item.get("ground_truth", None) for item in reward_model.tolist()]
             else:
                 gts = [None] * len(uids)
+
+            # Extract reward_extra_info from extra_fields (eval_msg, etc.)
+            extra_fields_list = data.pop("extra_fields", None)
+            eval_extra = {}
+            if extra_fields_list is not None:
+                for extra_field in extra_fields_list.tolist():
+                    if isinstance(extra_field, dict):
+                        rei = extra_field.get("reward_extra_info", {})
+                        for key, value in rei.items():
+                            if key == "score":
+                                continue
+                            eval_extra.setdefault(key, []).append(value)
 
             # Sort by uid key ({sample}_{rollout}_{output})
             sort_keys = []
@@ -1191,6 +1206,9 @@ class PPOTrainer(ABC):
             scores = [scores[i] for i in sorted_indices]
 
             reward_extra_infos_dict = {"uid": [real_keys[i] for i in sorted_indices]}
+            for key, values in eval_extra.items():
+                if len(values) == len(real_keys):
+                    reward_extra_infos_dict[key] = [values[i] for i in sorted_indices]
 
             self._dump_generations(
                 inputs=inputs,
@@ -1542,6 +1560,8 @@ class PPOTrainer(ABC):
             norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
             config=self.config.algorithm,
         )
+
+        metrics["_has_training_signal"] = bool(data.batch["advantages"].abs().sum().item() > 0)
 
         # 4. write nested advantages and returns back to TransferQueue
         fields = ["advantages", "returns"]
