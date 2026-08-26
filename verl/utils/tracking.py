@@ -279,8 +279,17 @@ class FileLogger:
             directory = os.path.join(root_path, self.project_name)
             os.makedirs(directory, exist_ok=True)
             self.filepath = os.path.join(directory, f"{self.experiment_name}.jsonl")
-        print(f"Creating file logger at {os.path.abspath(self.filepath)}")
-        self.fp = open(self.filepath, "wb", buffering=0)
+        # Append rather than truncate: an in-place resume reuses the same
+        # experiment name, and "wb" would wipe the metrics of every step the
+        # earlier attempt already completed. Appending keeps one continuous
+        # series across resumes; each record carries its own "step" field, so
+        # readers can dedupe if a step is ever recorded twice.
+        _resuming = os.path.exists(self.filepath) and os.path.getsize(self.filepath) > 0
+        print(
+            f"{'Appending to' if _resuming else 'Creating'} file logger at "
+            f"{os.path.abspath(self.filepath)}"
+        )
+        self.fp = open(self.filepath, "ab", buffering=0)
 
     def log(self, data, step):
         data = {"step": step, "data": data}
