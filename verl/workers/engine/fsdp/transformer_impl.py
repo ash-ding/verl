@@ -249,11 +249,40 @@ class FSDPEngine(BaseEngine):
             if self.model_config.model_type == "language_model":
                 auto_class = get_hf_auto_model_class(hf_config=self.model_config.hf_config)
 
+                # An MXFP4 checkpoint (openai/gpt-oss-*) stores each MoE expert as a
+                # blocks/scales pair, which no optimizer can update -- transformers
+                # raises "MXFP4 quantization don't support training" on the first
+                # backward. Dequantizing at load time is the only supported route, and
+                # every model this engine builds takes gradients or produces log-probs
+                # that must match the actor numerically, so do it unconditionally
+                # rather than asking each caller to remember.
+                _from_pretrained_kwargs = {}
+                _qcfg = getattr(self.model_config.hf_config, "quantization_config", None)
+                _qmethod = (
+                    _qcfg.get("quant_method")
+                    if isinstance(_qcfg, dict)
+                    else getattr(_qcfg, "quant_method", None)
+                )
+                if _qmethod == "mxfp4":
+                    from transformers import Mxfp4Config
+
+                    _skip = (
+                        _qcfg.get("modules_to_not_convert")
+                        if isinstance(_qcfg, dict)
+                        else getattr(_qcfg, "modules_to_not_convert", None)
+                    )
+                    _from_pretrained_kwargs["quantization_config"] = Mxfp4Config(
+                        dequantize=True,
+                        **({"modules_to_not_convert": _skip} if _skip else {}),
+                    )
+                    logger.info("MXFP4 checkpoint detected; dequantizing to %s for training", torch_dtype)
+
                 module = auto_class.from_pretrained(
                     pretrained_model_name_or_path=self.model_config.local_path,
                     torch_dtype=torch_dtype,
                     config=self.model_config.hf_config,
                     trust_remote_code=self.model_config.trust_remote_code,
+                    **_from_pretrained_kwargs,
                 )
 
                 # Strip sub-modules listed in _verl_strip_modules (e.g.
