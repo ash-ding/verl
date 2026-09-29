@@ -941,6 +941,38 @@ class vLLMHttpServer:
                 # for subprocesses patching
                 os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "1"
 
+        # A checkpoint that still declares MXFP4 makes vLLM select its
+        # gpt_oss_mxfp4 weight loader, which expects the fused expert names
+        # (experts.w13_weight / w2_weight) that quantized loading produces.
+        # The actor is dequantized to bf16 before training, so what arrives
+        # over IPC is plain HF tensors and that loader dies with
+        # KeyError: layers.0.mlp.experts.w13_weight on the first expert.
+        # Drop the declaration so vLLM builds an unquantized model whose
+        # loader matches the weights we actually send it.
+        if quantization is None:
+            _ckpt_q = getattr(self.model_config.hf_config, "quantization_config", None)
+            _ckpt_method = (
+                _ckpt_q.get("quant_method")
+                if isinstance(_ckpt_q, dict)
+                else getattr(_ckpt_q, "quant_method", None)
+            )
+            if _ckpt_method == "mxfp4":
+                # Not None: gpt_oss.py guards with hasattr and then subscripts,
+                # so a None value trades KeyError for TypeError. A dict whose
+                # quant_method is None is subscriptable and matches neither the
+                # mxfp4 nor the quark branch, so load_weights falls through to
+                # _load_weights_other -- the plain bf16 loader we need.
+                # Empty string, not None and not a missing key: vLLM reads this
+                # twice with different accessors. ModelConfig does
+                # quant_cfg.get("quant_method", "").lower() -- fine with "", fatal
+                # with None -- while gpt_oss.load_weights subscripts the key
+                # directly, so it has to be present. "" satisfies both and matches
+                # neither the mxfp4 nor the quark branch.
+                hf_overrides["quantization_config"] = {"quant_method": ""}
+                logger.info(
+                    "MXFP4 checkpoint served unquantized; the actor sends dequantized bf16 weights"
+                )
+
         if quantization is not None and self.config.quantization_config_file is not None:
             hf_overrides["quantization_config_file"] = self.config.quantization_config_file
 
