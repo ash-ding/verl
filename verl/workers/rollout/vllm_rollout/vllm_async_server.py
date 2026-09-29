@@ -957,7 +957,18 @@ class vLLMHttpServer:
                 else getattr(_ckpt_q, "quant_method", None)
             )
             if _ckpt_method == "mxfp4":
-                hf_overrides["quantization_config"] = None
+                # Not None: gpt_oss.py guards with hasattr and then subscripts,
+                # so a None value trades KeyError for TypeError. A dict whose
+                # quant_method is None is subscriptable and matches neither the
+                # mxfp4 nor the quark branch, so load_weights falls through to
+                # _load_weights_other -- the plain bf16 loader we need.
+                # Empty string, not None and not a missing key: vLLM reads this
+                # twice with different accessors. ModelConfig does
+                # quant_cfg.get("quant_method", "").lower() -- fine with "", fatal
+                # with None -- while gpt_oss.load_weights subscripts the key
+                # directly, so it has to be present. "" satisfies both and matches
+                # neither the mxfp4 nor the quark branch.
+                hf_overrides["quantization_config"] = {"quant_method": ""}
                 logger.info(
                     "MXFP4 checkpoint served unquantized; the actor sends dequantized bf16 weights"
                 )
